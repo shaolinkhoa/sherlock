@@ -10,24 +10,41 @@ networks.
 import csv
 import json
 import os
-import sys
 import platform
 import re
+import sys
+import random
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
+from concurrent.futures import ThreadPoolExecutor
 from time import time
 
 import requests
-from argparse import ArgumentParser, RawDescriptionHelpFormatter
-from concurrent.futures import ThreadPoolExecutor
 from colorama import Fore, Style, init
+
 from requests_futures.sessions import FuturesSession
 from torrequest import TorRequest
+from load_proxies import load_proxies_from_csv, check_proxy_list
 
 module_name = "Sherlock: Find Usernames Across Social Networks"
-__version__ = "0.2.6"
+__version__ = "0.5.7"
 amount = 0
+
+BANNER = r'''
+                                              ."""-.
+                                             /      \
+ ____  _               _            _        |  _..--'-.
+/ ___|| |__   ___ _ __| | ___   ___| |__    >.`__.-""\;"`
+\___ \| '_ \ / _ \ '__| |/ _ \ / __| |/ /   / /(     ^\
+ ___) | | | |  __/ |  | | (_) | (__|   <    '-`)     =|-.
+|____/|_| |_|\___|_|  |_|\___/ \___|_|\_\    /`--.'--'   \ .-.
+                                           .'`-._ `.\    | J /
+                                          /      `--.|   \__/'''[1:]
 
 # TODO: fix tumblr
 
+global proxy_list
+
+proxy_list = []
 
 class ElapsedFuturesSession(FuturesSession):
     """
@@ -55,17 +72,12 @@ class ElapsedFuturesSession(FuturesSession):
         return super(ElapsedFuturesSession, self).request(method, url, hooks=hooks, *args, **kwargs)
 
 
-def open_file(fname):
-    return open(fname, "a")
-
-
-def write_to_file(url, f):
-    f.write(url + "\n")
-
-
-def final_score(amount, f):
-    f.write("Total: "+str(amount) + "\n")
-
+def print_info(title, info):
+    print(Style.BRIGHT + Fore.GREEN + "[" +
+          Fore.YELLOW + "*" +
+          Fore.GREEN + f"] {title}" +
+          Fore.WHITE + f" {info}" +
+          Fore.GREEN + " on:")
 
 def print_error(err, errstr, var, verbose=False):
     print(Style.BRIGHT + Fore.WHITE + "[" +
@@ -86,7 +98,6 @@ def print_found(social_network, url, response_time, verbose=False):
            format_response_time(response_time, verbose) +
            Fore.GREEN + " {}:").format(social_network), url)
 
-
 def print_not_found(social_network, response_time, verbose=False):
     print((Style.BRIGHT + Fore.WHITE + "[" +
            Fore.RED + "-" +
@@ -95,14 +106,37 @@ def print_not_found(social_network, response_time, verbose=False):
            Fore.GREEN + " {}:" +
            Fore.YELLOW + " Not Found!").format(social_network))
 
+def print_invalid(social_network, msg):
+    """Print invalid search result."""
+    print((Style.BRIGHT + Fore.WHITE + "[" +
+           Fore.RED + "-" +
+           Fore.WHITE + "]" +
+           Fore.GREEN + " {}:" +
+           Fore.YELLOW + f" {msg}").format(social_network))
 
-def get_response(request_future, error_type, social_network, verbose=False):
+
+def get_response(request_future, error_type, social_network, verbose=False, retry_no=None):
+
+    global proxy_list
+
     try:
         rsp = request_future.result()
         if rsp.status_code:
             return rsp, error_type, rsp.elapsed
     except requests.exceptions.HTTPError as errh:
         print_error(errh, "HTTP Error:", social_network, verbose)
+
+    # In case our proxy fails, we retry with another proxy.
+    except requests.exceptions.ProxyError as errp:
+        if retry_no>0 and len(proxy_list)>0:
+            #Selecting the new proxy.
+            new_proxy = random.choice(proxy_list)
+            new_proxy = f'{new_proxy.protocol}://{new_proxy.ip}:{new_proxy.port}'
+            print(f'Retrying with {new_proxy}')
+            request_future.proxy = {'http':new_proxy,'https':new_proxy}
+            get_response(request_future,error_type, social_network, verbose,retry_no=retry_no-1)
+        else:
+            print_error(errp, "Proxy error:", social_network, verbose)
     except requests.exceptions.ConnectionError as errc:
         print_error(errc, "Error Connecting:", social_network, verbose)
     except requests.exceptions.Timeout as errt:
@@ -112,7 +146,7 @@ def get_response(request_future, error_type, social_network, verbose=False):
     return None, "", -1
 
 
-def sherlock(username, site_data, verbose=False, tor=False, unique_tor=False, proxy=None):
+def sherlock(username, site_data, verbose=False, tor=False, unique_tor=False, proxy=None, print_found_only=False):
     """Run Sherlock Analysis.
 
     Checks for existence of username on various social media sites.
@@ -139,20 +173,8 @@ def sherlock(username, site_data, verbose=False, tor=False, unique_tor=False, pr
                        there was an HTTP error when checking for existence.
     """
     global amount
-    fname = username.lower() + ".txt"
 
-    if os.path.isfile(fname):
-        os.remove(fname)
-        print((Style.BRIGHT + Fore.GREEN + "[" +
-               Fore.YELLOW + "*" +
-               Fore.GREEN + "] Removing previous file:" +
-               Fore.WHITE + " {}").format(fname))
-
-    print((Style.BRIGHT + Fore.GREEN + "[" +
-           Fore.YELLOW + "*" +
-           Fore.GREEN + "] Checking username" +
-           Fore.WHITE + " {}" +
-           Fore.GREEN + " on:").format(username))
+    print_info("Checking username", username)
 
     # A user agent is needed because some sites don't
     # return the correct information since they think that
@@ -191,11 +213,7 @@ def sherlock(username, site_data, verbose=False, tor=False, unique_tor=False, pr
         regex_check = net_info.get("regexCheck")
         if regex_check and re.search(regex_check, username) is None:
             # No need to do the check at the site: this user name is not allowed.
-            print((Style.BRIGHT + Fore.WHITE + "[" +
-                   Fore.RED + "-" +
-                   Fore.WHITE + "]" +
-                   Fore.GREEN + " {}:" +
-                   Fore.YELLOW + " Illegal Username Format For This Site!").format(social_network))
+            print_invalid(social_network, "Illegal Username Format For This Site!")
             results_site["exists"] = "illegal"
         else:
             # URL of user on site (if it exists)
@@ -208,13 +226,27 @@ def sherlock(username, site_data, verbose=False, tor=False, unique_tor=False, pr
                 if net_info["errorType"] == 'status_code':
                     request_method = session.head
 
+            if net_info["errorType"] == "response_url":
+                # Site forwards request to a different URL if username not
+                # found.  Disallow the redirect so we can capture the
+                # http status from the original URL request.
+                allow_redirects = False
+            else:
+                # Allow whatever redirect that the site wants to do.
+                # The final result of the request will be what is available.
+                allow_redirects = True
+
             # This future starts running the request in a new thread, doesn't block the main thread
             if proxy != None:
                 proxies = {"http": proxy, "https": proxy}
-                future = request_method(
-                    url=url, headers=headers, proxies=proxies)
+                future = request_method(url=url, headers=headers,
+                                        proxies=proxies,
+                                        allow_redirects=allow_redirects
+                                        )
             else:
-                future = request_method(url=url, headers=headers)
+                future = request_method(url=url, headers=headers,
+                                        allow_redirects=allow_redirects
+                                        )
 
             # Store future in data for access later
             net_info["request_future"] = future
@@ -227,8 +259,6 @@ def sherlock(username, site_data, verbose=False, tor=False, unique_tor=False, pr
         results_total[social_network] = results_site
 
     # Open the file containing account links
-    f = open_file(fname)
-
     # Core logic: If tor requests, make them here. If multi-threaded requests, wait for responses
     for social_network, net_info in site_data.items():
 
@@ -254,7 +284,8 @@ def sherlock(username, site_data, verbose=False, tor=False, unique_tor=False, pr
         r, error_type, response_time = get_response(request_future=future,
                                                     error_type=error_type,
                                                     social_network=social_network,
-                                                    verbose=verbose)
+                                                    verbose=verbose,
+                                                    retry_no=3)
 
         # Attempt to get request information
         try:
@@ -271,42 +302,42 @@ def sherlock(username, site_data, verbose=False, tor=False, unique_tor=False, pr
             # Checks if the error message is in the HTML
             if not error in r.text:
                 print_found(social_network, url, response_time, verbose)
-                write_to_file(url, f)
                 exists = "yes"
                 amount = amount+1
             else:
-                print_not_found(social_network, response_time, verbose)
+                if not print_found_only:
+                    print_not_found(social_network, response_time, verbose)
                 exists = "no"
 
         elif error_type == "status_code":
             # Checks if the status code of the response is 2XX
             if not r.status_code >= 300 or r.status_code < 200:
                 print_found(social_network, url, response_time, verbose)
-                write_to_file(url, f)
                 exists = "yes"
                 amount = amount+1
             else:
-                print_not_found(social_network, response_time, verbose)
+                if not print_found_only:
+                    print_not_found(social_network, response_time, verbose)
                 exists = "no"
 
         elif error_type == "response_url":
-            error = net_info.get("errorUrl")
-            # Checks if the redirect url is the same as the one defined in data.json
-            if not error in r.url:
+            # For this detection method, we have turned off the redirect.
+            # So, there is no need to check the response URL: it will always
+            # match the request.  Instead, we will ensure that the response
+            # code indicates that the request was successful (i.e. no 404, or
+            # forward to some odd redirect).
+            if 200 <= r.status_code < 300:
+                #
                 print_found(social_network, url, response_time, verbose)
-                write_to_file(url, f)
                 exists = "yes"
                 amount = amount+1
             else:
-                print_not_found(social_network, response_time, verbose)
+                if not print_found_only:
+                    print_not_found(social_network, response_time, verbose)
                 exists = "no"
 
         elif error_type == "":
-            print((Style.BRIGHT + Fore.WHITE + "[" +
-                   Fore.RED + "-" +
-                   Fore.WHITE + "]" +
-                   Fore.GREEN + " {}:" +
-                   Fore.YELLOW + " Error!").format(social_network))
+            print_invalid(social_network, "Error!")
             exists = "error"
 
         # Save exists flag
@@ -319,13 +350,6 @@ def sherlock(username, site_data, verbose=False, tor=False, unique_tor=False, pr
 
         # Add this site's results into final dictionary with all of the other results.
         results_total[social_network] = results_site
-
-    print((Style.BRIGHT + Fore.GREEN + "[" +
-           Fore.YELLOW + "*" +
-           Fore.GREEN + "] Saved: " +
-           Fore.WHITE + "{}").format(fname))
-
-    final_score(amount, f)
     return results_total
 
 
@@ -348,9 +372,14 @@ def main():
                         action="store_true",  dest="verbose", default=False,
                         help="Display extra debugging information and metrics."
                         )
-    parser.add_argument("--quiet", "-q",
-                        action="store_false", dest="verbose",
-                        help="Disable debugging information (Default Option)."
+    parser.add_argument("--rank", "-r",
+                        action="store_true", dest="rank", default=False,
+                        help="Present websites ordered by their Alexa.com global rank in popularity.")
+    parser.add_argument("--folderoutput", "-fo", dest="folderoutput",
+                        help="If using multiple usernames, the output of the results will be saved at this folder."
+                        )
+    parser.add_argument("--output", "-o", dest="output",
+                        help="If using single username, the output of the result will be saved at this file."
                         )
     parser.add_argument("--tor", "-t",
                         action="store_true", dest="tor", default=False,
@@ -371,6 +400,23 @@ def main():
                         action="store", dest="proxy", default=None,
                         help="Make requests over a proxy. e.g. socks5://127.0.0.1:1080"
                         )
+    parser.add_argument("--json", "-j", metavar="JSON_FILE",
+                        dest="json_file", default="data.json",
+                        help="Load data from a JSON file or an online, valid, JSON file.")
+    parser.add_argument("--proxy_list", "-pl", metavar='PROXY_LIST',
+                        action="store", dest="proxy_list", default=None,
+                        help="Make requests over a proxy randomly chosen from a list generated from a .csv file."
+                        )
+    parser.add_argument("--check_proxies", "-cp", metavar='CHECK_PROXY',
+                        action="store", dest="check_prox", default=None,
+                        help="To be used with the '--proxy_list' parameter. "
+                             "The script will check if the proxies supplied in the .csv file are working and anonymous."
+                             "Put 0 for no limit on successfully checked proxies, or another number to institute a limit."
+                        )
+    parser.add_argument("--print-found",
+                        action="store_true", dest="print_found_only", default=False,
+                        help="Do not output sites where the username was not found."
+                        )
     parser.add_argument("username",
                         nargs='+', metavar='USERNAMES',
                         action="store",
@@ -379,35 +425,93 @@ def main():
 
     args = parser.parse_args()
 
-    # Banner
-    print(Fore.WHITE + Style.BRIGHT +
-          """                                              .\"\"\"-.
-                                             /      \\
- ____  _               _            _        |  _..--'-.
-/ ___|| |__   ___ _ __| | ___   ___| |__    >.`__.-\"\"\;\"`
-\___ \| '_ \ / _ \ '__| |/ _ \ / __| |/ /   / /(     ^\\
- ___) | | | |  __/ |  | | (_) | (__|   <    '-`)     =|-.
-|____/|_| |_|\___|_|  |_|\___/ \___|_|\_\    /`--.'--'   \ .-.
-                                           .'`-._ `.\    | J /
-                                          /      `--.|   \__/""")
+    print(Fore.WHITE + Style.BRIGHT + BANNER)
 
     # Argument check
     # TODO regex check on args.proxy
-    if args.tor and args.proxy != None:
+    if args.tor and (args.proxy != None or args.proxy_list != None):
         raise Exception("TOR and Proxy cannot be set in the meantime.")
+
+    # Proxy argument check.
+    # Does not necessarily need to throw an error,
+    # since we could join the single proxy with the ones generated from the .csv,
+    # but it seems unnecessarily complex at this time.
+    if args.proxy != None and args.proxy_list != None:
+        raise Exception("A single proxy cannot be used along with proxy list.")
 
     # Make prompts
     if args.proxy != None:
         print("Using the proxy: " + args.proxy)
+
+    global proxy_list
+
+    if args.proxy_list != None:
+        print_info("Loading proxies from", args.proxy_list)
+
+        proxy_list = load_proxies_from_csv(args.proxy_list)
+
+    # Checking if proxies should be checked for anonymity.
+    if args.check_prox != None and args.proxy_list != None:
+        try:
+            limit = int(args.check_prox)
+            if limit == 0:
+                proxy_list = check_proxy_list(proxy_list)
+            elif limit > 0:
+                proxy_list = check_proxy_list(proxy_list, limit)
+            else:
+                raise ValueError
+        except ValueError:
+            raise Exception("Prameter --check_proxies/-cp must be a positive intiger.")
+
     if args.tor or args.unique_tor:
         print("Using TOR to make requests")
         print("Warning: some websites might refuse connecting over TOR, so note that using this option might increase connection errors.")
 
-    # Load the data
+    # Check if both output methods are entered as input.
+    if args.output is not None and args.folderoutput is not None:
+        print("You can only use one of the output methods.")
+        sys.exit(1)
+
+    # Check validity for single username output.
+    if args.output is not None and len(args.username) != 1:
+        print("You can only use --output with a single username")
+        sys.exit(1)
+
+    response_json_online = None
+    site_data_all = None
+
+    # Try to load json from website.
+    try:
+        response_json_online = requests.get(url=args.json_file)
+    except requests.exceptions.MissingSchema:  # In case the schema is wrong it's because it may not be a website
+        pass
+
+    # Check if the response is appropriate.
+    if response_json_online is not None and response_json_online.status_code == 200:
+        # Since we got data from a website, try to load json and exit if parsing fails.
+        try:
+            site_data_all = response_json_online.json()
+        except ValueError:
+            print("Invalid JSON from website!")
+            sys.exit(1)
+            pass
+
     data_file_path = os.path.join(os.path.dirname(
-        os.path.realpath(__file__)), "data.json")
-    with open(data_file_path, "r", encoding="utf-8") as raw:
-        site_data_all = json.load(raw)
+        os.path.realpath(__file__)), args.json_file)
+    # This will be none if the request had a missing schema
+    if site_data_all is None:
+        # Check if the file exists otherwise exit.
+        if not os.path.exists(data_file_path):
+            print("JSON file at doesn't exist.")
+            print(
+                "If this is not a file but a website, make sure you have appended http:// or https://.")
+            sys.exit(1)
+        else:
+            raw = open(data_file_path, "r", encoding="utf-8")
+            try:
+                site_data_all = json.load(raw)
+            except:
+                print("Invalid JSON loaded from file.")
 
     if args.site_list is None:
         # Not desired to look at a sub-set of sites
@@ -431,12 +535,49 @@ def main():
                 f"Error: Desired sites not found: {', '.join(site_missing)}.")
             sys.exit(1)
 
+    if args.rank:
+        # Sort data by rank
+        site_dataCpy = dict(site_data)
+        ranked_sites = sorted(site_data, key=lambda k: ("rank" not in k, site_data[k].get("rank", sys.maxsize)))
+        site_data = {}
+        for site in ranked_sites:
+            site_data[site] = site_dataCpy.get(site)
+
     # Run report on all specified users.
     for username in args.username:
         print()
+
+        if args.output:
+            file = open(args.output, "w", encoding="utf-8")
+        elif args.folderoutput:  # In case we handle multiple usernames at a targetted folder.
+            # If the folder doesnt exist, create it first
+            if not os.path.isdir(args.folderoutput):
+                os.mkdir(args.folderoutput)
+            file = open(os.path.join(args.folderoutput,
+                                     username + ".txt"), "w", encoding="utf-8")
+        else:
+            file = open(username + ".txt", "w", encoding="utf-8")
+
+        # We try to ad a random member of the 'proxy_list' var as the proxy of the request.
+        # If we can't access the list or it is empty, we proceed with args.proxy as the proxy.
+        try:
+            random_proxy = random.choice(proxy_list)
+            proxy = f'{random_proxy.protocol}://{random_proxy.ip}:{random_proxy.port}'
+        except (NameError, IndexError):
+            proxy = args.proxy
+
         results = {}
         results = sherlock(username, site_data, verbose=args.verbose,
-                           tor=args.tor, unique_tor=args.unique_tor, proxy=args.proxy)
+                           tor=args.tor, unique_tor=args.unique_tor, proxy=args.proxy, print_found_only=args.print_found_only)
+
+        exists_counter = 0
+        for website_name in results:
+            dictionary = results[website_name]
+            if dictionary.get("exists") == "yes":
+                exists_counter += 1
+                file.write(dictionary["url_user"] + "\n")
+        file.write("Total Websites : {}".format(exists_counter))
+        file.close()
 
         if args.csv == True:
             with open(username + ".csv", "w", newline='', encoding="utf-8") as csv_report:
